@@ -1,6 +1,8 @@
-"""端到端 API 测试：提交、跨批归并、诊断、查询。"""
+"""端到端 API 测试：提交、跨批归并、诊断、查询、断链补链。"""
 
 from __future__ import annotations
+
+import importlib
 
 
 def _m(mid, irt=None, refs=None, sent="2026-09-18T10:00:00+00:00", subject="hello"):
@@ -136,3 +138,235 @@ def test_message_not_found(client):
 
 def test_empty_batch_rejected(client):
     assert client.post("/batches", json={"messages": []}).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /relinks：迟到邮件归档后批量修复断链
+# ---------------------------------------------------------------------------
+
+
+def test_relink_uses_late_in_reply_to_and_updates_threads_and_roots(client):
+    b1 = client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("D", irt="late", refs=["ghost"], sent="2026-09-18T09:00:00+00:00"),
+    ]}).json()
+    assert client.get("/messages/D").json()["parent_id"] is None
+
+    # 迟到邮件归档（其本身挂到 A 下）
+    client.post("/batches", json={"messages": [
+        _m("late", irt="A", refs=["A"], sent="2026-09-18T07:00:00+00:00"),
+    ]})
+
+    r = client.post("/relinks", json={"message_ids": ["D"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["relinked"] == 1
+    assert body["results"] == [{
+        "message_id": "D",
+        "old_parent_id": None,
+        "new_parent_id": "late",
+        "old_root_id": "D",
+        "new_root_id": "A",
+    }]
+
+    # GET /threads 随即反映新树：A -> late -> D
+    tree = client.get("/threads/D").json()
+    assert tree["root_id"] == "A"
+    assert tree["tree"]["message_id"] == "A"
+    assert [c["message_id"] for c in tree["tree"]["children"]] == ["late"]
+    assert [g["message_id"] for g in tree["tree"]["children"][0]["children"]] == ["D"]
+    assert client.get("/messages/D").json()["parent_id"] == "late"
+
+    # 既有批次结果快照保持不变：快照里 D 仍是断链根
+    snap = client.get(f"/batches/{b1['batch_id']}").json()
+    snap_d = [t for t in snap["threads"] if t["message_id"] == "D"][0]
+    assert snap_d["parent_id"] is None
+    assert snap == b1
+
+
+def test_relink_is_idempotent(client):
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("D", irt="A-missing", refs=["late-A"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    client.post("/batches", json={"messages": [
+        _m("late-A", sent="2026-09-18T07:00:00+00:00"),
+    ]})
+    first = client.post("/relinks", json={"message_ids": ["D"]}).json()
+    assert first["relinked"] == 1
+
+    again = client.post("/relinks", json={"message_ids": ["D"]}).json()
+    assert again["relinked"] == 0
+    assert again["results"][0] == {
+        "message_id": "D",
+        "old_parent_id": "late-A",
+        "new_parent_id": "late-A",
+        "old_root_id": "late-A",
+        "new_root_id": "late-A",
+    }
+
+
+def test_relink_falls_back_through_references_right_to_left(client):
+    # 归档时所有引用都不存在 -> 断链根；迟到两个候选后补链，取 references 最右已知项
+    client.post("/batches", json={"messages": [
+        _m("F", irt="still-missing", refs=["g1", "late1", "late2"],
+           sent="2026-09-18T10:00:00+00:00"),
+    ]})
+    client.post("/batches", json={"messages": [
+        _m("late1", sent="2026-09-18T06:00:00+00:00"),
+        _m("late2", irt="late1", refs=["late1"], sent="2026-09-18T07:00:00+00:00"),
+    ]})
+    body = client.post("/relinks", json={"message_ids": ["F"]}).json()
+    item = body["results"][0]
+    assert item["old_parent_id"] is None
+    assert item["new_parent_id"] == "late2"
+    assert item["old_root_id"] == "F"
+    assert item["new_root_id"] == "late1"
+
+
+def test_relink_no_candidate_stays_unchanged(client):
+    client.post("/batches", json={"messages": [
+        _m("G", irt="nope", refs=["n1", "n2"], sent="2026-09-18T10:00:00+00:00"),
+    ]})
+    body = client.post("/relinks", json={"message_ids": ["G"]}).json()
+    assert body["relinked"] == 0
+    assert body["results"][0] == {
+        "message_id": "G",
+        "old_parent_id": None,
+        "new_parent_id": None,
+        "old_root_id": "G",
+        "new_root_id": "G",
+    }
+    assert client.get("/messages/G").json()["parent_id"] is None
+
+
+def test_relink_skips_already_attached_and_invalid(client):
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T00:00:00+00:00"),
+        _m("H", irt="R", refs=["R"], sent="2026-09-18T11:00:00+00:00"),
+        _m("cyc1", irt="cyc2", refs=["cyc2"], sent="2026-09-18T12:00:00+00:00"),
+        _m("cyc2", irt="cyc1", refs=["cyc1"], sent="2026-09-18T13:00:00+00:00"),
+    ]})
+    body = client.post("/relinks", json={"message_ids": ["H", "cyc1"]}).json()
+    assert body["relinked"] == 0
+    assert body["results"] == [
+        {"message_id": "H", "old_parent_id": "R", "new_parent_id": "R",
+         "old_root_id": "R", "new_root_id": "R"},
+        {"message_id": "cyc1", "old_parent_id": None, "new_parent_id": None,
+         "old_root_id": "cyc1", "new_root_id": "cyc1"},
+    ]
+
+
+def test_relink_unknown_id_returns_404_and_writes_nothing(client):
+    client.post("/batches", json={"messages": [_m("A")]})
+    r = client.post("/relinks", json={"message_ids": ["A", "ghost-id"]})
+    assert r.status_code == 404
+    assert r.json()["detail"]["message_ids"] == ["ghost-id"]
+    # A 即便本可命中也整批不处理
+    assert client.get("/messages/A").json()["parent_id"] is None
+
+
+def test_relink_empty_and_blank_ids_rejected(client):
+    assert client.post("/relinks", json={"message_ids": []}).status_code == 422
+    assert client.post("/relinks", json={"message_ids": ["   "]}).status_code == 422
+
+
+def test_relink_dedupes_ids_and_preserves_order(client):
+    client.post("/batches", json={"messages": [
+        _m("A", sent="2026-09-18T08:00:00+00:00"),
+        _m("G", irt="nope", refs=["n1"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    body = client.post("/relinks", json={"message_ids": ["G", "A", "G", " A "]}).json()
+    assert [r["message_id"] for r in body["results"]] == ["G", "A"]
+
+
+def _open_db():
+    """按当前 DATABASE_PATH 直连测试库（绕过服务连接）。"""
+    import sqlite3
+
+    from app import config
+
+    importlib.reload(config)
+    conn = sqlite3.connect(config.settings.database_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def test_relink_merged_cycle_returns_409_and_writes_nothing(client):
+    # 真实归档不会自然产生两个互指的有效根；直接构造该初始状态，
+    # 验证候选关系合并后统一检测环、整次 409 且不写库。
+    client.post("/batches", json={"messages": [_m("p", sent="2026-09-18T14:00:00+00:00")]})
+    client.post("/batches", json={"messages": [_m("q", sent="2026-09-18T15:00:00+00:00")]})
+    conn = _open_db()
+    try:
+        conn.execute("UPDATE messages SET in_reply_to='q', \"references\"='[\"q\"]' WHERE message_id='p'")
+        conn.execute("UPDATE messages SET in_reply_to='p', \"references\"='[\"p\"]' WHERE message_id='q'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.post("/relinks", json={"message_ids": ["p", "q"]})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["cycles"] == [["p", "q"]]
+
+    conn = _open_db()
+    try:
+        rows = {row["message_id"]: row["parent_id"]
+                for row in conn.execute("SELECT message_id, parent_id FROM messages")}
+    finally:
+        conn.close()
+    assert rows == {"p": None, "q": None}
+
+    # 只修一封可以成功；再修第二封时与既有边合并又成环 -> 409 且不写库
+    assert client.post("/relinks", json={"message_ids": ["p"]}).json()["results"][0]["new_parent_id"] == "q"
+    r2 = client.post("/relinks", json={"message_ids": ["q"]})
+    assert r2.status_code == 409
+    conn = _open_db()
+    try:
+        row = conn.execute("SELECT parent_id FROM messages WHERE message_id='q'").fetchone()
+    finally:
+        conn.close()
+    assert row["parent_id"] is None
+
+
+def test_relink_invalid_cycle_members_are_not_candidate_parents(client):
+    # ca/cb 同批成环 invalid；M 只引用环成员、N 的 references 指向迟到邮件：
+    # 环剔除后 M/N 都断链为根。补链时环成员同样不得作为候选父。
+    client.post("/batches", json={"messages": [
+        _m("ca", irt="cb", refs=["cb"], sent="2026-09-18T18:00:00+00:00"),
+        _m("cb", irt="ca", refs=["ca"], sent="2026-09-18T18:10:00+00:00"),
+        _m("M", irt="ca", refs=["ca"], sent="2026-09-18T18:20:00+00:00"),
+        _m("N", irt="ca", refs=["lateV"], sent="2026-09-18T18:30:00+00:00"),
+    ]})
+    assert client.get("/messages/M").json()["parent_id"] is None
+    assert client.get("/messages/N").json()["parent_id"] is None
+
+    body = client.post("/relinks", json={"message_ids": ["M"]}).json()
+    assert body["relinked"] == 0
+    assert body["results"][0] == {
+        "message_id": "M", "old_parent_id": None, "new_parent_id": None,
+        "old_root_id": "M", "new_root_id": "M",
+    }
+
+    # lateV 迟到归档后，N 越过环成员回退到 references 中的有效项
+    client.post("/batches", json={"messages": [
+        _m("lateV", sent="2026-09-18T05:00:00+00:00"),
+    ]})
+    item = client.post("/relinks", json={"message_ids": ["N"]}).json()["results"][0]
+    assert item["old_parent_id"] is None
+    assert item["new_parent_id"] == "lateV"
+    assert item["new_root_id"] == "lateV"
+
+
+def test_relink_self_candidate_is_a_cycle(client):
+    client.post("/batches", json={"messages": [_m("zz", sent="2026-09-18T16:00:00+00:00")]})
+    conn = _open_db()
+    try:
+        conn.execute("UPDATE messages SET in_reply_to='zz', \"references\"='[]' WHERE message_id='zz'")
+        conn.commit()
+    finally:
+        conn.close()
+    r = client.post("/relinks", json={"message_ids": ["zz"]})
+    assert r.status_code == 409
+    assert r.json()["detail"]["cycles"] == [["zz"]]

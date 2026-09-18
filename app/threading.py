@@ -64,7 +64,7 @@ class BatchResolution:
     roots: list[str]
 
 
-def _pick_candidate(
+def pick_candidate(
     msg: ThreadMessage,
     known_ids: set[str],
     invalid_ids: set[str],
@@ -92,20 +92,24 @@ def _pick_candidate(
     return None
 
 
-def _find_cycles(
-    new_ids: set[str],
+def find_cycles(
     parent_of: dict[str, Optional[str]],
 ) -> list[list[str]]:
-    """在新邮件构成的功能子图中找出全部环。
+    """在一张功能图（节点 -> 候选父节点或 None）上找出全部环。
 
-    父节点为历史邮件或为 None 的边会穿出子图，不可能成环。
+    父节点为 None、或父 ID 不在映射中的边会穿出图，不可能成环。
+    返回的每个环统一从环内最小 ID 起头，整体按环序列表排序。
+
+    归并批次时 parent_of 只含本批新邮件，该函数即等价于在“新邮件
+    子图”内找环；relink 修复时传入的是合并了既有父指针与全部候选
+    关系的整图，从而跨候选统一检测环。
     """
 
     WHITE, GRAY, BLACK = 0, 1, 2
-    color: dict[str, int] = {mid: WHITE for mid in new_ids}
+    color: dict[str, int] = {mid: WHITE for mid in parent_of}
     cycles: list[list[str]] = []
 
-    for start in sorted(new_ids):
+    for start in sorted(parent_of):
         if color[start] != WHITE:
             continue
         stack: list[str] = []
@@ -113,19 +117,19 @@ def _find_cycles(
         while cur is not None and color.get(cur, BLACK) == WHITE:
             color[cur] = GRAY
             stack.append(cur)
-            nxt = parent_of.get(cur)
-            if nxt is None or nxt not in color:
-                break  # 穿出子图
-            cur = nxt
+            cur = parent_of.get(cur)
         else:
             # 以 GRAY 节点收尾 => 发现环
             if cur is not None and color.get(cur) == GRAY:
-                idx = stack.index(cur)
-                cycles.append(stack[idx:])
+                cyc = stack[stack.index(cur):]
+                k = cyc.index(min(cyc))
+                cyc = cyc[k:] + cyc[:k]
+                cycles.append(cyc)
 
         for node in stack:
             color[node] = BLACK
 
+    cycles.sort(key=lambda c: c)
     return cycles
 
 
@@ -199,22 +203,17 @@ def resolve_batch(
         for mid, msg in first_seen.items():
             if mid in invalid_ids:
                 continue
-            parent_of[mid] = _pick_candidate(msg, known_ids, invalid_ids)
+            parent_of[mid] = pick_candidate(msg, known_ids, invalid_ids)
 
-        found = _find_cycles(new_ids - invalid_ids, parent_of)
+        # 父指针为历史邮件或为 None 的边会穿出本批子图，不可能成环；
+        # find_cycles 对不在映射中的父节点天然视为穿出。
+        found = find_cycles(parent_of)
         if not found:
             break
 
-        normalized: list[list[str]] = []
         for cyc in found:
-            k = cyc.index(min(cyc))
-            cyc = cyc[k:] + cyc[:k]
-            normalized.append(cyc)
             invalid_ids.update(cyc)
-        normalized.sort(key=lambda c: c)
-        cycles.extend(normalized)
-
-    cycles.sort(key=lambda c: c)
+        cycles.extend(found)
 
     roots = sorted(
         (mid for mid, pid in parent_of.items() if pid is None),

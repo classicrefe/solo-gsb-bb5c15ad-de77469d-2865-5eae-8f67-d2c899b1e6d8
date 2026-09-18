@@ -9,8 +9,24 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import database, threading
-from .schemas import BatchIn
+from .schemas import BatchIn, RelinkIn
 from .threading import ThreadMessage
+
+
+class RelinkNotFound(Exception):
+    """POST /relinks：请求中存在未归档的 message_id。"""
+
+    def __init__(self, message_ids: list[str]) -> None:
+        self.message_ids = message_ids
+        super().__init__(f"messages not found: {message_ids}")
+
+
+class RelinkCycleConflict(Exception):
+    """POST /relinks：合并候选关系后出现环，整次拒绝、不写库。"""
+
+    def __init__(self, cycles: list[list[str]]) -> None:
+        self.cycles = cycles
+        super().__init__(f"relink would create cycles: {cycles}")
 
 
 def _utc_now_iso() -> str:
@@ -290,6 +306,135 @@ def submit_batch(payload: BatchIn) -> dict:
 
             conn.commit()
             return result_payload
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def _climb_root_inmem(
+    message_id: str, parent_of: dict[str, Optional[str]]
+) -> str:
+    """在内存父指针图上向上爬到根（遇到不存在或环时回退为当前节点）。"""
+
+    cur = message_id
+    seen: set[str] = set()
+    while True:
+        pid = parent_of.get(cur)
+        if pid is None or pid in seen:
+            return cur
+        seen.add(cur)
+        cur = pid
+
+
+def relink_messages(payload: RelinkIn) -> dict:
+    """迟到邮件归档后，批量修复此前断链的有效邮件。
+
+    - 每封邮件仅在当前 parent_id 为空（断链自成根）且非环内 invalid 时处理；
+    - 候选父仍按原规则：先取现存且有效的 in_reply_to，再从 references
+      右向左回退；无法命中则保持不变；
+    - 全部候选关系合并到既有父指针图上统一检测环，任一变更成环则整次
+      抛 RelinkCycleConflict，绝不写库；
+    - 无环时在单事务中更新 parent_id，返回每封邮件的新旧 parent/root。
+    """
+
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT message_id, in_reply_to, "references", parent_id, is_invalid
+                FROM messages
+                WHERE message_id IN (%s)
+                """ % ",".join("?" * len(payload.message_ids)),
+                payload.message_ids,
+            ).fetchall() if payload.message_ids else []
+
+            by_id = {r["message_id"]: r for r in rows}
+            missing = [mid for mid in payload.message_ids if mid not in by_id]
+            if missing:
+                raise RelinkNotFound(missing)
+
+            # 既有整图：所有已归档有效邮件的当前父指针
+            base_parents: dict[str, Optional[str]] = {
+                r["message_id"]: r["parent_id"]
+                for r in conn.execute(
+                    "SELECT message_id, parent_id FROM messages WHERE is_invalid = 0"
+                )
+            }
+            # 环内 invalid 邮件不是“有效”节点，不可作为候选父
+            invalid_ids = {
+                r["message_id"]
+                for r in conn.execute(
+                    "SELECT message_id FROM messages WHERE is_invalid = 1"
+                )
+            }
+
+            # 逐封计算候选；仅有效且当前为断链根的邮件参与
+            candidates: dict[str, Optional[str]] = {}
+            for mid in payload.message_ids:
+                row = by_id[mid]
+                if row["is_invalid"] or row["parent_id"] is not None:
+                    continue
+                msg = ThreadMessage(
+                    message_id=mid,
+                    in_reply_to=row["in_reply_to"],
+                    references=tuple(json.loads(row["references"])),
+                    sent_at="",
+                    subject="",
+                )
+                # 已知集合 = 有效邮件全集；环成员(invalid) 不作为父
+                candidates[mid] = threading.pick_candidate(
+                    msg, set(base_parents), invalid_ids=invalid_ids
+                )
+
+            # 合并全部候选关系后统一检测环
+            merged_parents = dict(base_parents)
+            for mid, new_pid in candidates.items():
+                merged_parents[mid] = new_pid
+
+            cycles = threading.find_cycles(merged_parents)
+            if cycles:
+                raise RelinkCycleConflict(cycles)
+
+            results: list[dict] = []
+            relinked = 0
+            updates: list[tuple[Optional[str], str]] = []
+            for mid in payload.message_ids:
+                row = by_id[mid]
+                old_pid = row["parent_id"]
+                new_pid = candidates.get(mid, old_pid)
+                changed = new_pid != old_pid
+                if changed:
+                    relinked += 1
+                    updates.append((new_pid, mid))
+                old_root = (
+                    mid
+                    if old_pid is None or row["is_invalid"]
+                    else _climb_root_inmem(mid, base_parents)
+                )
+                new_root = (
+                    mid
+                    if new_pid is None or row["is_invalid"]
+                    else _climb_root_inmem(mid, merged_parents)
+                )
+                results.append({
+                    "message_id": mid,
+                    "old_parent_id": old_pid,
+                    "new_parent_id": new_pid,
+                    "old_root_id": old_root,
+                    "new_root_id": new_root,
+                })
+
+            # 单事务提交全部父指针变更
+            for new_pid, mid in updates:
+                conn.execute(
+                    "UPDATE messages SET parent_id = ? WHERE message_id = ?",
+                    (new_pid, mid),
+                )
+            conn.commit()
+            return {"relinked": relinked, "results": results}
         except Exception:
             conn.rollback()
             raise

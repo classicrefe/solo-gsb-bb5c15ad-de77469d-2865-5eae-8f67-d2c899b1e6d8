@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class MessageIn(BaseModel):
@@ -40,6 +40,32 @@ class MessageIn(BaseModel):
 
 class BatchIn(BaseModel):
     messages: list[MessageIn] = Field(..., min_length=1)
+
+
+class RelinkIn(BaseModel):
+    """POST /relinks：待补链的 message_id 列表。"""
+
+    message_ids: list[str] = Field(
+        ..., min_length=1, description="待修复断链邮件的 message_id（自动去空白、去重，保序处理）"
+    )
+
+    @field_validator("message_ids")
+    @classmethod
+    def _strip_ids(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in v:
+            mid = raw.strip()
+            if mid and mid not in seen:
+                seen.add(mid)
+                out.append(mid)
+        return out
+
+    @model_validator(mode="after")
+    def _require_nonempty(self) -> "RelinkIn":
+        if not self.message_ids:
+            raise ValueError("message_ids must contain at least one non-empty id")
+        return self
 
 
 class TreeNode(BaseModel):
@@ -109,6 +135,19 @@ class MessageOut(BaseModel):
     parent_id: Optional[str]
     is_invalid: bool
     batch_id: str
+
+
+class RelinkItem(BaseModel):
+    message_id: str
+    old_parent_id: Optional[str]
+    new_parent_id: Optional[str]
+    old_root_id: str
+    new_root_id: str
+
+
+class RelinkResult(BaseModel):
+    relinked: int = Field(..., description="实际发生父节点变更的邮件数")
+    results: list[RelinkItem] = Field(..., description="按请求顺序逐封给出新旧父/根；未变更者新旧值相同")
 
 
 TreeNode.model_rebuild()

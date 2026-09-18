@@ -42,6 +42,39 @@ class BatchIn(BaseModel):
     messages: list[MessageIn] = Field(..., min_length=1)
 
 
+class RelinkIn(BaseModel):
+    """POST /relinks 请求：待修复断链邮件的 message_id 列表。"""
+
+    message_ids: list[str] = Field(
+        ..., min_length=1, description="待处理邮件 ID；重复项按出现顺序去重"
+    )
+
+    @field_validator("message_ids")
+    @classmethod
+    def _strip_ids(cls, v: list[str]) -> list[str]:
+        ids = [s.strip() for s in v if s and s.strip()]
+        if not ids:
+            raise ValueError("message_ids must contain at least one non-empty id")
+        return ids
+
+
+class RelinkItem(BaseModel):
+    """单封邮件的修复结果（未变更时四个字段前后相同）。"""
+
+    message_id: str
+    old_parent_id: Optional[str]
+    new_parent_id: Optional[str]
+    old_root_id: Optional[str]
+    new_root_id: Optional[str]
+    updated: bool = Field(..., description="True 表示本次为其补挂了父节点")
+
+
+class RelinkResult(BaseModel):
+    total: int = Field(..., description="去重后的待处理邮件数")
+    updated: int = Field(..., description="实际补挂父节点的邮件数")
+    results: list[RelinkItem]
+
+
 class TreeNode(BaseModel):
     message_id: str
     parent_id: Optional[str]

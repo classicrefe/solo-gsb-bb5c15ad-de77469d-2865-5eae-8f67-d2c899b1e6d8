@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from app.threading import ThreadMessage, build_forest, resolve_batch
+from app.threading import (
+    ThreadMessage,
+    build_forest,
+    find_cycles_in_parent_map,
+    normalize_cycles,
+    pick_relink_parent,
+    resolve_batch,
+)
 
 
 def msg(mid, irt=None, refs=(), sent="2026-09-18T00:00:00+00:00", subj="s"):
@@ -189,3 +196,38 @@ def test_cycle_does_not_poison_unrelated_tree():
     assert r.parent_of["goodroot"] is None
     forest = build_forest(r.first_seen, r.parent_of)
     assert ids(forest) == ["goodroot", "ok"]
+
+
+# ---------------------------------------------------------------------------
+# POST /relinks 复用的纯逻辑：候选挑选 + 全量父子图环检测
+# ---------------------------------------------------------------------------
+
+def test_pick_relink_parent_prefers_in_reply_to():
+    m = msg("D", irt="A", refs=["B", "A"])
+    assert pick_relink_parent(m, {"A", "B"}) == "A"
+
+
+def test_pick_relink_parent_falls_back_right_to_left():
+    m = msg("D", irt="ghost", refs=["ghost", "A", "B"])
+    assert pick_relink_parent(m, {"A", "B"}) == "B"
+
+
+def test_pick_relink_parent_none_when_no_valid_candidate():
+    m = msg("D", irt="ghost", refs=["ghost", "phantom"])
+    assert pick_relink_parent(m, {"A"}) is None
+
+
+def test_pick_relink_parent_skips_invalid_ids():
+    # in_reply_to 指向环内无效邮件，回退到 references 中的有效项
+    m = msg("D", irt="bad", refs=["bad", "R"])
+    assert pick_relink_parent(m, {"R"}) == "R"
+
+
+def test_find_cycles_in_full_parent_map():
+    parent_of = {"A": "C", "B": "A", "C": "B", "R": None, "Z": "R"}
+    assert normalize_cycles(find_cycles_in_parent_map(parent_of)) == [["A", "C", "B"]]
+
+
+def test_find_cycles_empty_and_acyclic():
+    assert find_cycles_in_parent_map({}) == []
+    assert find_cycles_in_parent_map({"A": None, "B": "A", "C": "A"}) == []

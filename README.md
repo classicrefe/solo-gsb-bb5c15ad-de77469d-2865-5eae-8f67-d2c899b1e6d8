@@ -47,6 +47,7 @@ ports:
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点 |
+| `POST` | `/relinks` | 迟到邮件归档后，批量修复断链有效邮件的父节点（HTTP 200） |
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树；环邮件返回 **409** |
 | `GET` | `/health` | 健康检查 |
 
@@ -111,6 +112,48 @@ curl -X POST http://localhost:8000/batches \
 }
 ```
 
+### 修复断链：`POST /relinks`
+
+邮件可能因**父邮件迟到**（提交时 `in_reply_to` / `references` 指向的邮件尚未归档）
+而断链、自成根节点。待迟到邮件在后续批次归档后，可用 `/relinks` 批量补挂：
+
+- 请求给出待处理的 `message_id`（重复项按出现顺序去重）；
+- 每封邮件**仅在当前 `parent_id` 为空时**参与，按原规则挑选父节点：
+  先取现已存在且有效的 `in_reply_to`，再从 `references` 右向左回退，
+  都无法命中则保持不变；已有父节点、或环内 `invalid` 之外的邮件不会被改动；
+- **所有候选关系合并后统一检测环**：任一变更会形成环时，整次请求返回
+  **409** 且**不写库**；否则在单事务中更新 `parent_id`，并逐封返回
+  `old_parent_id` / `new_parent_id` / `old_root_id` / `new_root_id`；
+- 修复后 `GET /threads`、`GET /messages` 随即反映新树；
+  **既有批次结果快照与诊断明细保持不变**（快照是提交那一刻的存档）。
+
+错误：包含不存在的 ID 返回 **404**（`detail.message_ids` 列出缺失 ID）；
+包含环内 `invalid` 邮件返回 **422**；候选关系成环返回 **409**（`detail.cycles` 列出环）。
+
+```bash
+# D 早先因父邮件 A 迟到而断链；A 归档后修复 D
+curl -X POST http://localhost:8000/relinks \
+  -H 'Content-Type: application/json' \
+  -d '{"message_ids": ["D"]}'
+```
+
+```jsonc
+{
+  "total": 1,
+  "updated": 1,
+  "results": [
+    {
+      "message_id": "D",
+      "old_parent_id": null,
+      "new_parent_id": "A",
+      "old_root_id": "D",        // 断链时自成根
+      "new_root_id": "A",        // 补挂后所属会话根
+      "updated": true
+    }
+  ]
+}
+```
+
 ## 归并规则
 
 - **父节点确定**
@@ -127,6 +170,8 @@ curl -X POST http://localhost:8000/batches \
   `(sent_at UTC, message_id)` 升序，先序输出，结果全序确定、可复现。
 - **跨批次**：历史邮件是合法的父节点；历史父指针不可变，因此引用环只可能完全位于
   同一批新邮件内部。
+- **迟到修复**：提交时引用邮件尚未归档会断链自成根；待迟到邮件归档后，可用
+  `POST /relinks` 按原规则批量补挂，候选边合并后统一检测环，成环整批回滚不写库。
 - **时间**：`sent_at` 无时区时按 UTC 处理，有偏移时换算为 UTC 存储与排序。
 
 ## 持久化
@@ -139,6 +184,8 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 - `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回。
 
 写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交下的归并一致性。
+`POST /relinks` 同样持该锁、在单事务内仅更新 `messages.parent_id`，
+`batch_results` 快照与各诊断表不变。
 
 ## 本地开发（不使用 Docker）
 

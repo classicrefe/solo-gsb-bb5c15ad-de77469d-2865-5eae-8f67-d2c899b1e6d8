@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -129,6 +129,46 @@ def _find_cycles(
     return cycles
 
 
+def normalize_cycles(cycles: list[list[str]]) -> list[list[str]]:
+    """把环统一旋转为环内最小 ID 起头，并按起头稳定排序。"""
+
+    normalized: list[list[str]] = []
+    for cyc in cycles:
+        k = cyc.index(min(cyc))
+        normalized.append(cyc[k:] + cyc[:k])
+    normalized.sort(key=lambda c: c)
+    return normalized
+
+
+def pick_relink_parent(
+    msg: ThreadMessage,
+    valid_ids: set[str],
+) -> Optional[str]:
+    """迟到邮件归档后，为断链邮件重新挑选父节点。
+
+    规则与归并时完全一致：先取现已存在且有效的 in_reply_to，
+    再从 references 右向左回退，命不中返回 None（保持断链）。
+
+    Args:
+        msg: 待修复邮件。
+        valid_ids: 当前库中所有有效（非环内 invalid）邮件的 ID。
+    """
+
+    return _pick_candidate(msg, valid_ids, invalid_ids=set())
+
+
+def find_cycles_in_parent_map(parent_of: Mapping[str, Optional[str]]) -> list[list[str]]:
+    """在一张完整的父子功能图上检测全部环。
+
+    relink 把所有候选新边合并进当前 parent 图后调用本函数统一检测，
+    任一变更成环即整体放弃。
+    """
+
+    if not parent_of:
+        return []
+    return _find_cycles(set(parent_of.keys()), parent_of)
+
+
 def resolve_batch(
     submitted: Iterable[ThreadMessage],
     existing_ids: Iterable[str] = (),
@@ -205,13 +245,9 @@ def resolve_batch(
         if not found:
             break
 
-        normalized: list[list[str]] = []
-        for cyc in found:
-            k = cyc.index(min(cyc))
-            cyc = cyc[k:] + cyc[:k]
-            normalized.append(cyc)
+        normalized = normalize_cycles(found)
+        for cyc in normalized:
             invalid_ids.update(cyc)
-        normalized.sort(key=lambda c: c)
         cycles.extend(normalized)
 
     cycles.sort(key=lambda c: c)

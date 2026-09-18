@@ -13,6 +13,15 @@ from .schemas import BatchIn
 from .threading import ThreadMessage
 
 
+class RelinkError(Exception):
+    """POST /relinks 的业务错误，由路由层翻译为对应 HTTP 状态码。"""
+
+    def __init__(self, status_code: int, detail: dict) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -41,6 +50,22 @@ def _climb_root(conn: sqlite3.Connection, message_id: str) -> str:
             return cur
         seen.add(cur)
         cur = pid
+
+
+def _climb_root_map(
+    parent_of: dict[str, Optional[str]], message_id: str
+) -> Optional[str]:
+    """在内存父子图上向上爬到根；带 seen 防御，任何成环情况也能终止。"""
+
+    cur: Optional[str] = message_id
+    seen: set[str] = set()
+    while cur is not None and cur not in seen:
+        seen.add(cur)
+        pid = parent_of.get(cur)
+        if pid is None:
+            return cur
+        cur = pid
+    return cur
 
 
 def _load_subtree(conn: sqlite3.Connection, root_id: str) -> tuple[dict[str, ThreadMessage], dict[str, Optional[str]]]:
@@ -290,6 +315,129 @@ def submit_batch(payload: BatchIn) -> dict:
 
             conn.commit()
             return result_payload
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def relink_messages(message_ids: list[str]) -> dict:
+    """迟到邮件归档后，批量修复此前断链的有效邮件。
+
+    - 仅处理当前 parent_id 为空、且非环内 invalid 的邮件；
+    - 每封按原规则挑选候选父：先有效 in_reply_to，再 references 右向左；
+    - 所有候选关系合并进当前父子图后统一检测环，任一变更成环整批 409 不写库；
+    - 否则在单事务中更新 parent_id。批次结果快照与诊断明细保持不变。
+    """
+
+    # 请求序去重
+    ordered: list[str] = []
+    dedup: set[str] = set()
+    for mid in message_ids:
+        if mid not in dedup:
+            dedup.add(mid)
+            ordered.append(mid)
+
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT message_id, in_reply_to, "references", sent_at, subject,
+                       parent_id, is_invalid
+                FROM messages
+                """
+            ).fetchall()
+
+            stored: dict[str, sqlite3.Row] = {}
+            parent_of: dict[str, Optional[str]] = {}
+            valid_ids: set[str] = set()
+            for row in rows:
+                mid = row["message_id"]
+                stored[mid] = row
+                parent_of[mid] = row["parent_id"]
+                if not row["is_invalid"]:
+                    valid_ids.add(mid)
+
+            # 未知 ID：整批 404，不写库
+            missing = [mid for mid in ordered if mid not in stored]
+            if missing:
+                raise RelinkError(
+                    status_code=404,
+                    detail={"error": "messages not found", "message_ids": missing},
+                )
+
+            # 环内 invalid 邮件不参与修复：整批 422，不写库
+            invalid_requested = [
+                mid for mid in ordered if stored[mid]["is_invalid"]
+            ]
+            if invalid_requested:
+                raise RelinkError(
+                    status_code=422,
+                    detail={
+                        "error": "messages are invalid (reference cycle) and cannot be relinked",
+                        "message_ids": invalid_requested,
+                    },
+                )
+
+            # 仅当前 parent_id 为空的邮件参与候选挑选
+            candidates: dict[str, str] = {}
+            for mid in ordered:
+                row = stored[mid]
+                if row["parent_id"] is not None:
+                    continue
+                msg = _row_to_message(row)
+                candidate = threading.pick_relink_parent(msg, valid_ids)
+                if candidate is not None:
+                    candidates[mid] = candidate
+
+            # 所有候选边合并后统一检测环
+            simulated = dict(parent_of)
+            simulated.update(candidates)
+            cycles = threading.find_cycles_in_parent_map(simulated)
+            if cycles:
+                raise RelinkError(
+                    status_code=409,
+                    detail={
+                        "error": "relink would create a reference cycle",
+                        "cycles": threading.normalize_cycles(cycles),
+                    },
+                )
+
+            # 旧根（变更前）
+            old_root_of = {mid: _climb_root_map(parent_of, mid) for mid in ordered}
+
+            # 单事务更新 parent_id；快照表与诊断表一律不动
+            for mid, new_parent in candidates.items():
+                conn.execute(
+                    "UPDATE messages SET parent_id = ? WHERE message_id = ? AND parent_id IS NULL",
+                    (new_parent, mid),
+                )
+            conn.commit()
+
+            # 新根（变更后）
+            new_root_of = {mid: _climb_root_map(simulated, mid) for mid in ordered}
+
+            results = [
+                {
+                    "message_id": mid,
+                    "old_parent_id": stored[mid]["parent_id"],
+                    "new_parent_id": candidates.get(mid, stored[mid]["parent_id"]),
+                    "old_root_id": old_root_of[mid],
+                    "new_root_id": new_root_of[mid],
+                    "updated": mid in candidates,
+                }
+                for mid in ordered
+            ]
+            return {
+                "total": len(ordered),
+                "updated": len(candidates),
+                "results": results,
+            }
+        except RelinkError:
+            conn.rollback()
+            raise
         except Exception:
             conn.rollback()
             raise

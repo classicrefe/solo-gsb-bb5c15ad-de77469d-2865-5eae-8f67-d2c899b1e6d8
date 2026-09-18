@@ -13,6 +13,8 @@ from .schemas import (
     BatchResult,
     BatchSummary,
     MessageOut,
+    RelinkIn,
+    RelinkResult,
 )
 
 
@@ -69,6 +71,19 @@ def get_batch(batch_id: str) -> dict:
     if result is None:
         raise HTTPException(status_code=404, detail="batch not found")
     return result
+
+
+@app.post(
+    "/relinks",
+    response_model=RelinkResult,
+    tags=["messages"],
+    summary="迟到邮件归档后，批量修复断链有效邮件的父节点",
+)
+def relink_messages(payload: RelinkIn) -> dict:
+    try:
+        return service.relink_messages(payload.message_ids)
+    except service.RelinkError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
 @app.get(
